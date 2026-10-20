@@ -264,7 +264,13 @@ _install_refresh_current() (
 
 _install_copy_local_source() (
     set -o pipefail
-    tar -C "$1" --exclude-vcs-ignores \
+    local path
+    local -a excludes=()
+    # notebook 允许安装在源码所在的持久化目录下；排除安装和暂存目录，避免递归复制。
+    for path in "${install_home:-}" "$2" "${work:-}"; do
+        case "$path" in "$1"/*) excludes+=(--exclude="./${path#"$1"/}") ;; esac
+    done
+    tar -C "$1" "${excludes[@]}" --exclude-vcs-ignores \
         --exclude='./.git' --exclude='./.env' --exclude='./.clashctl-*' \
         --exclude='./data' --exclude='./bin' --exclude='./archives' \
         --exclude='./resources/dist' --exclude='./resources/cache.db' \
@@ -609,6 +615,13 @@ _source_archive() (
 
 _source_validate() {
     local directory=$1 file relative
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ] || [ "${notebook:-false}" = true ]; then
+        if [ ! -f "$directory/init.sh" ] || [ -L "$directory/init.sh" ] ||
+            ! grep -q '^CLASHCTL_INSTALL_MODE=' "$directory/.env.example"; then
+            printf '源码不支持 notebook 模式，请使用 --local 或包含 notebook 功能的分支\n' >&2
+            return 1
+        fi
+    fi
     for file in .env.example install.sh uninstall.sh scripts/preflight.sh scripts/lib/operation-lock.sh scripts/lib/install-maintenance.sh scripts/cmd/clashctl.sh scripts/cmd/update.sh; do
         if [ ! -f "$directory/$file" ] || [ -L "$directory/$file" ]; then
             printf '源码不兼容：缺少必需文件 %s\n' "$file" >&2
@@ -684,6 +697,11 @@ _install_intro() {
 
 _install_next_step() {
     local shell=$1 rc_var rc_path load_command command_width=32
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+        printf '\n在当前 Bash 执行:\n  source %q  # 加载命令、启动内核并启用代理\n' "$CLASHCTL_HOME/init.sh" >&2
+        printf '  source %q --commands-only  # 仅加载命令\n' "$CLASHCTL_HOME/init.sh" >&2
+        return 0
+    fi
     case "$shell" in bash | zsh | fish) ;; *) shell=bash ;; esac
     rc_var=SHELL_RC_${shell^^}
     rc_path=${!rc_var:-}
@@ -849,6 +867,19 @@ _install_restore_service() {
     _install_ui_warn "安装未完成，已恢复原运行方式：$service_previous_manager"
 }
 
+# 原子物化配置，保证 notebook 失败续装时也能在首次取锁前识别模式。
+_install_initial_env() (
+    local tmp
+    [ ! -f "$CLASHCTL_HOME/.env" ] || return 0
+    tmp=$(mktemp "$CLASHCTL_HOME/.env.XXXXXX") || return 1
+    trap 'command rm -f -- "$tmp"' EXIT
+    cat "$CLASHCTL_HOME/.env.example" >"$tmp" || return 1
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+        printf '\nCLASHCTL_INSTALL_MODE=notebook\n' >>"$tmp" || return 1
+    fi
+    chmod 0600 "$tmp" && mv -f -- "$tmp" "$CLASHCTL_HOME/.env"
+)
+
 _install_initialize() {
     export CLASHCTL_SRC="$CLASHCTL_HOME"
     . "$CLASHCTL_SRC/scripts/preflight.sh" || return 1
@@ -857,6 +888,15 @@ _install_initialize() {
     # 参数在 main 中保存，不受 preflight 加载已有 .env 的影响。
     local kernel=${1:-${CLASHCTL_KERNEL:-mihomo}} branch=${2:-${CLASHCTL_UPDATE_BRANCH:-master}}
     local proxy=${3:-} subscription=${7:-} requested_service=${8:-auto} rc secret shell_backup=''
+    local notebook=${9:-false} subscription_type=${10:-url}
+    if [ "$notebook" = true ] || [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+        [ "$requested_service" = auto ] || [ "$requested_service" = nohup ] || {
+            _install_ui_error 'notebook 模式仅支持 --service nohup'; return 1;
+        }
+        CLASHCTL_INSTALL_MODE=notebook
+        requested_service='nohup'
+        _install_ui_info "notebook 模式：当前 UID $(id -u)，使用 nohup"
+    fi
     _INSTALL_SUBSCRIPTION_RETRY=false
     export -n subscription secret
     export CLASHCTL_KERNEL="$kernel" CLASHCTL_UPDATE_BRANCH="$branch" GH_PROXY="$proxy"
@@ -888,11 +928,12 @@ _install_initialize() {
     _INSTALL_DEFER_DOWNLOAD_HINT=$defer_download_hint prepare_zip kernel yq || return 1
     # 在写入配置、注册服务之前撤销未初始化凭据；后续丢失 .env 不能按空安装删除。
     command rm -f -- "$CLASHCTL_HOME/.clashctl-uninitialized" || return 1
-    [ -f "$CLASHCTL_HOME/.env" ] || install -m 0600 "$CLASHCTL_HOME/.env.example" "$CLASHCTL_HOME/.env" || return 1
+    _install_initial_env || return 1
     _set_env CLASHCTL_KERNEL "$kernel" || return 1
     _set_env CLASHCTL_UPDATE_BRANCH "$branch" || return 1
     _set_env GH_PROXY "$proxy" || return 1
     _set_env CLASHCTL_DOWNLOAD_TIMEOUT "$CLASHCTL_DOWNLOAD_TIMEOUT" || return 1
+    [ "${CLASHCTL_INSTALL_MODE:-}" != notebook ] || _set_env CLASHCTL_INSTALL_MODE notebook || return 1
     local switch_saved_service=$saved_service
     # 旧版迁移已有独立的停止与回滚流程，新目录不再记录一次后端切换事务。
     [ -z "${6:-}" ] || switch_saved_service=''
@@ -916,11 +957,17 @@ _install_initialize() {
 
     if [ -z "$subscription" ] && [ ! -s "$CLASH_CONFIG_BASE" ] &&
         [ "${CI+x}" != x ] && ( : </dev/tty ) 2>/dev/null; then
+        _install_ui_info '可输入订阅链接或单行 Base64；多行内容可用 --sub-base64-file 导入'
         _read_subscription_url subscription '       订阅链接（回车跳过）: ' </dev/tty || subscription=''
     fi
     if [ -n "$subscription" ]; then
         # 订阅失败不算安装失败：组件、命令和服务都已就绪，此时报"安装未完成"会误导用户重装。
-        if ! clashsub add --use "$subscription"; then
+        local -a subscription_args=("$subscription")
+        case $subscription_type in
+        base64) subscription_args=(--base64 "$subscription") ;;
+        file) subscription_args=(--base64-file "$subscription") ;;
+        esac
+        if ! clashsub add --use "${subscription_args[@]}"; then
             _install_ui_warn '订阅添加失败，可稍后重试'
             _INSTALL_SUBSCRIPTION_RETRY=true
         fi
@@ -989,6 +1036,8 @@ main() (
     local home_source='默认值（~/.clashctl）'
     [ -z "${CLASHCTL_HOME:-}" ] || home_source=CLASHCTL_HOME
     local branch=${CLASHCTL_UPDATE_BRANCH:-} kernel='' subscription='' requested_service=auto
+    local notebook=false subscription_type=url subscription_set=false
+    local CLASHCTL_INSTALL_MODE=''
     local proxy=${GH_PROXY:-} proxy_set=${GH_PROXY+x} stage='' arg method
     local requested_timeout=${CLASHCTL_DOWNLOAD_TIMEOUT-} timeout_set=${CLASHCTL_DOWNLOAD_TIMEOUT+x}
     local local_source=false script_dir='' existing_kind='' legacy_home='' legacy_kernel='' backup=''
@@ -1029,14 +1078,29 @@ main() (
             shift
             ;;
         --sub=*)
+            [ "$subscription_set" = false ] || { printf '只能指定一个订阅来源\n' >&2; return 1; }
+            subscription_set=true
             subscription=${arg#*=}
             [ -n "$subscription" ] || { printf '%s\n' '--sub 需要一个订阅链接' >&2; return 1; }
             ;;
         --sub)
+            [ "$subscription_set" = false ] || { printf '只能指定一个订阅来源\n' >&2; return 1; }
+            subscription_set=true
             [ "$#" -gt 0 ] && [ -n "$1" ] || { printf '%s\n' '--sub 需要一个订阅链接' >&2; return 1; }
             subscription=$1
             shift
             ;;
+        --sub-base64 | --sub-base64-file | --sub-base64=* | --sub-base64-file=*)
+            [ "$subscription_set" = false ] || { printf '只能指定一个订阅来源\n' >&2; return 1; }
+            subscription_set=true
+            case $arg in --sub-base64-file*) subscription_type='file' ;; *) subscription_type=base64 ;; esac
+            case $arg in
+            *=*) subscription=${arg#*=} ;;
+            *) [ "$#" -gt 0 ] || { printf '%s 需要参数\n' "$arg" >&2; return 1; }; subscription=$1; shift ;;
+            esac
+            [ -n "$subscription" ] || { printf 'Base64 内容或文件路径不能为空\n' >&2; return 1; }
+            ;;
+        --notebook) notebook=true ;;
         --local) local_source=true ;;
         --service=*) requested_service=${arg#*=} ;;
         --service)
@@ -1071,9 +1135,13 @@ main() (
 
 安装选项:
   --local                 使用本地源码安装，依赖仍按需下载
+  --notebook              持久化 notebook 安装：默认 $PWD/.clashctl，固定 nohup
+                          不修改 Shell rc；source <安装目录>/init.sh 恢复代理
   --home <路径>           指定安装目录（绝对路径，默认 ~/.clashctl）
   --kernel <内核>         mihomo（默认）或 clash；已有安装不可切换
   --sub <URL>             添加并启用订阅；无现有配置时交互询问
+  --sub-base64 <内容>     导入 Base64 YAML 或节点列表（手动订阅不更新）
+  --sub-base64-file <文件> 从文件读取 Base64；- 表示标准输入
   --service <方式>        auto（默认）、systemd-user 或 nohup
                           auto 沿用已有方式；新装普通用户优先用户级 systemd
 
@@ -1114,6 +1182,17 @@ HELP
     auto | systemd-user | nohup) ;;
     *) printf '%s\n' '--service 仅支持 auto、systemd-user 或 nohup' >&2; return 1 ;;
     esac
+    if [ "$notebook" = true ]; then
+        [ "$requested_service" = auto ] || [ "$requested_service" = nohup ] || {
+            printf 'notebook 模式仅支持 --service nohup\n' >&2; return 1;
+        }
+        requested_service='nohup'
+        CLASHCTL_INSTALL_MODE=notebook
+        if [ "$home_source" = '默认值（~/.clashctl）' ]; then
+            install_home="$PWD/.clashctl"
+            home_source='默认值（$PWD/.clashctl）'
+        fi
+    fi
     if [ "$requested_service" = systemd-user ] && [ "$(id -u)" -eq 0 ]; then
         printf '%s\n' 'systemd-user 需要以目标普通用户运行安装器' >&2
         return 1
@@ -1142,7 +1221,12 @@ HELP
     fi
     if [ "$local_source" = true ]; then
         case "$install_home/" in
-        "$script_dir/"*) printf '本地安装目录不能位于源码目录内，请通过 --home 指定其他目录\n' >&2; return 1 ;;
+        "$script_dir/") printf '安装目录不能与源码目录相同\n' >&2; return 1 ;;
+        "$script_dir/"*)
+            # 已安装的 notebook 续装时可省略 --notebook（模式稍后从 .env 读取）。
+            if [ "$notebook" != true ] && ! grep -qx 'CLASHCTL_INSTALL_MODE=notebook' "$install_home/.env" 2>/dev/null; then
+                printf '本地安装目录不能位于源码目录内，请通过 --home 指定其他目录\n' >&2; return 1
+            fi ;;
         esac
     fi
     if [ -e "$install_home" ] || [ -L "$install_home" ]; then
@@ -1155,6 +1239,14 @@ HELP
             fi
         fi
         if [ "$existing_kind" = current ]; then
+            # 在第一次取锁前确定模式；root notebook 的续装也必须一直使用 /tmp 锁。
+            # 模式字段由安装器以此字面值写入，无需在取锁前执行用户 .env。
+            if grep -qx 'CLASHCTL_INSTALL_MODE=notebook' "$install_home/.env" 2>/dev/null; then
+                CLASHCTL_INSTALL_MODE=notebook
+            elif [ "$notebook" = true ] && [ -f "$install_home/.env" ]; then
+                printf '已有普通安装不自动转换为 notebook 模式，请用 --home 指定独立目录\n' >&2
+                return 1
+            fi
             if [ -n "$script_dir" ] && [ -f "$script_dir/scripts/lib/operation-lock.sh" ] &&
                 grep -q '^_directory_lock_acquire()' "$script_dir/scripts/lib/operation-lock.sh"; then
                 _install_lock "$script_dir" || return 1
@@ -1180,8 +1272,17 @@ HELP
             # 先读取已保存的选项；本次显式参数与环境变量优先。
             if [ -f "$install_home/.env" ]; then
                 local requested_kernel=$kernel requested_branch=$branch requested_proxy=$proxy
+                CLASHCTL_INSTALL_MODE=''
                 # shellcheck source=/dev/null
                 . "$install_home/.env" || return 1
+                if [ "$notebook" = true ] && [ "${CLASHCTL_INSTALL_MODE:-}" != notebook ]; then
+                    printf '已有普通安装不自动转换为 notebook 模式，请用 --home 指定独立目录\n' >&2
+                    return 1
+                fi
+                if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ] &&
+                    [ "$requested_service" != auto ] && [ "$requested_service" != nohup ]; then
+                    printf 'notebook 模式仅支持 --service nohup\n' >&2; return 1
+                fi
                 if [ -n "$requested_kernel" ] && [ "$requested_kernel" != "${CLASHCTL_KERNEL:-mihomo}" ]; then
                     printf '已有安装不支持切换内核（%s → %s），请使用原内核重试\n' \
                         "${CLASHCTL_KERNEL:-mihomo}" "$requested_kernel" >&2
@@ -1209,11 +1310,12 @@ HELP
             prepared_archives=true
             existing_kind=''
         else
+            [ "$notebook" != true ] || { printf '旧安装不自动迁移为 notebook 模式，请另选目录\n' >&2; return 1; }
             legacy_home=$install_home
         fi
     else
         # 历史版本默认安装到 ~/clashctl；新默认目录空闲时自动搬迁已验证的旧安装。
-        if [ "$install_home" = "$HOME/.clashctl" ] && [ -d "$HOME/clashctl" ]; then
+        if [ "$notebook" != true ] && [ "$install_home" = "$HOME/.clashctl" ] && [ -d "$HOME/clashctl" ]; then
             if existing_kind=$(_install_existing_kind "$HOME/clashctl"); then
                 case $existing_kind in
                 legacy-v1 | legacy-v2) legacy_home="$HOME/clashctl" ;;
@@ -1351,7 +1453,7 @@ HELP
     export CLASHCTL_HOME="$install_home" CLASHCTL_SRC="$install_home" CLASHCTL_KERNEL="$kernel"
     export CLASHCTL_UPDATE_BRANCH="$branch" GH_PROXY="$proxy"
     if ! { (umask 077; : >"$install_home/.clashctl-incomplete") &&
-        _install_initialize "$kernel" "$branch" "$proxy" "$timeout_set" "$requested_timeout" "$backup" "$subscription" "$requested_service"; }; then
+        _install_initialize "$kernel" "$branch" "$proxy" "$timeout_set" "$requested_timeout" "$backup" "$subscription" "$requested_service" "$notebook" "$subscription_type"; }; then
         if [ -n "$backup" ]; then
             _install_legacy_rollback "$legacy_home" "$backup" "$install_home" "$legacy_kernel" || return 1
         else
@@ -1369,6 +1471,7 @@ HELP
             fi
             printf -v branch_arg ' --branch=%q' "$branch"
             retry_command+=$branch_arg
+            [ "$notebook" != true ] || retry_command+=' --notebook'
             if [ -n "$proxy" ] || [ "$proxy_set" = x ]; then
                 printf -v proxy_arg ' --gh-proxy=%q' "$proxy"
                 retry_command+=$proxy_arg

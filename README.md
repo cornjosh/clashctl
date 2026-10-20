@@ -75,6 +75,15 @@ curl -fsSL "${GH_PROXY}https://raw.githubusercontent.com/nelvko/clashctl/HEAD/in
 
 ## 🚀 快速上手
 
+### Notebook 临时开发环境
+
+- 在持久化目录执行 `bash /路径/clashctl/install.sh --local --notebook`，默认安装到 `$PWD/.clashctl`，可用 `--home /持久化目录/clashctl-home` 指定目录（或使用 `CLASHCTL_HOME`）。
+- 自动识别 root/普通用户，使用 `nohup` 管理进程，不修改 Shell 启动配置，默认关闭 TUN；持久化文件保存在安装目录，临时文件可使用 `/tmp`。
+- 新终端执行 `source /安装目录/init.sh` 即可加载命令并启动代理；追加 `--commands-only` 仅加载命令，代理环境变量只影响当前 Bash 及其子进程。
+- 安装或 `clashctl sub add --use` 时，可在订阅提示处直接粘贴单行 Base64（YAML 或节点链接列表），也可用 `clashctl sub add --use --base64 '完整编码'`；手动导入的订阅不参与更新。
+
+### 常规使用
+
 添加并启用订阅（可选）：
 
 ```bash

@@ -10,6 +10,7 @@ data/
 .clashctl-incomplete
 .clashctl-files
 .env
+.clashctl/
 bin/
 resources/dist/
 resources/proxies/

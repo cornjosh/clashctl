@@ -38,7 +38,7 @@ case "$url" in
     printf '%s\n' "$name" >>"$COMPONENT_DOWNLOADS"
     cp "$COMPONENT_FIXTURES/$file" "$destination"
     ;;
-http://localhost:25500/version) printf fixture ;;
+http://127.0.0.1:25500/version) printf fixture ;;
 https://api64.ipify.org) printf 127.0.0.1 ;;
 *) printf 'unexpected URL: %s\n' "$url" >&2; exit 99 ;;
 esac

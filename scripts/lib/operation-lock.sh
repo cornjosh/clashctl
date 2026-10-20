@@ -58,7 +58,7 @@ _operation_lock_validate_tmp() {
 
 _operation_lock_base() {
     local uid=$1 base
-    if [ "$uid" -eq 0 ] && _operation_lock_validate_base /run 0; then
+    if [ "${CLASHCTL_INSTALL_MODE:-}" != notebook ] && [ "$uid" -eq 0 ] && _operation_lock_validate_base /run 0; then
         printf '/run\n'
         return 0
     fi

@@ -247,7 +247,7 @@ _sub_download() {
 _sub_default_name() {
     local url=$1 host
     case $url in
-    file://*) host=local ;;
+    file://* | manual:*) host=local ;;
     *)
         host=${url#*://}
         host=${host%%/*}
@@ -476,6 +476,7 @@ _sub_pick() {
 
 sub_add() {
     local use_after_add=false name='' url='' strategy=auto
+    local input_type=url input_value=''
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -491,6 +492,8 @@ Usage:
 Options:
   -n, --name <名称>   指定名称（默认取订阅文件名或链接域名）
   -u, --use           保存后立即启用
+  --base64 <内容>     导入 Base64 YAML 或节点列表（不联网更新）
+  --base64-file <文件> 从文件读取 Base64；- 表示标准输入
   --raw               不转换，直接校验下载内容
   --convert           强制转换后校验
   -t, --timeout <秒>  下载超时（默认 ${CLASHCTL_SUB_TIMEOUT:-20} 秒）
@@ -504,6 +507,15 @@ EOF
             ;;
         -u | --use)
             use_after_add=true
+            ;;
+        --base64 | --base64-file | --base64=* | --base64-file=*)
+            [ "$input_type" = url ] || { _errorcat '只能指定一个 Base64 来源'; return 1; }
+            case $1 in --base64-file*) input_type='file' ;; *) input_type=base64 ;; esac
+            case $1 in
+            *=*) input_value=${1#*=} ;;
+            *) [ "$#" -ge 2 ] || { _errorcat "选项 $1 需要参数"; return 1; }; input_value=$2; shift ;;
+            esac
+            [ -n "$input_value" ] || { _errorcat 'Base64 内容或文件路径不能为空'; return 1; }
             ;;
         --convert)
             [ "$strategy" = raw ] && {
@@ -578,13 +590,24 @@ EOF
     done
 
     [ -z "$url" ] && [ $# -gt 0 ] && url=$1
+    if [ "$input_type" != url ]; then
+        [ -z "$url" ] || { _errorcat 'Base64 输入不能与订阅链接同时指定'; return 1; }
+        _sub_import_base64 "$input_type" "$input_value" "$name" "$use_after_add" "$strategy"
+        return
+    fi
     [ -z "$url" ] && {
+        _ui_emit_fd 2 info '支持订阅链接或单行 Base64；多行内容请使用 --base64-file <文件或 ->'
         _read_subscription_url url '请输入要添加的订阅链接：' || return 1
         [ -z "$url" ] && {
             _errorcat "订阅链接不能为空"
             return 1
         }
     }
+    # 保留 URL 原样；不含协议头的输入按 Base64 内容处理。
+    if [[ "$url" != *://* ]]; then
+        _sub_import_base64 base64 "$url" "$name" "$use_after_add" "$strategy"
+        return
+    fi
 
     if [ -n "$name" ]; then
         _sub_validate_name "$name" || return 1
@@ -611,9 +634,63 @@ ${_SUB_DL_DEBUG_HINT:-转换日志：$BIN_SUBCONVERTER_LOG}"
     return "$rc"
 }
 
+# 手动内容只在本地解码/转换；成功后沿用同一把订阅锁提交。
+# 子 Shell 确保取消、失败和提交后都清理本次临时文件。
+_sub_import_base64() (
+    set -o pipefail
+    local input_type=$1 input_value=$2 name=$3 use_after_add=$4 strategy=$5 work encoded padding
+    work=$(mktemp -d "${CLASH_RESOURCES_DIR}/.import.XXXXXX") || return 1
+    trap 'command rm -rf -- "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    if [ "$input_type" = file ]; then
+        if [ "$input_value" = - ]; then
+            cat >"$work/encoded" || return 1
+        else
+            cat -- "$input_value" >"$work/encoded" || return 1
+        fi
+    else
+        printf '%s' "$input_value" >"$work/encoded" || return 1
+    fi
+    encoded=$(LC_ALL=C tr -d '[:space:]' <"$work/encoded" | tr '_-' '/+') || return 1
+    [[ -n "$encoded" && "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || {
+        _errorcat 'Base64 内容无效或为空'; return 1;
+    }
+    padding=$((${#encoded} % 4))
+    if [[ "$encoded" == *=* ]]; then
+        [ "$padding" -eq 0 ] || { _errorcat 'Base64 填充无效'; return 1; }
+    else
+        case $padding in
+        1) _errorcat 'Base64 长度无效'; return 1 ;;
+        2) encoded+='==' ;;
+        3) encoded+='=' ;;
+        esac
+    fi
+    printf '%s' "$encoded" | base64 --decode >"$work/decoded" || { _errorcat 'Base64 解码失败'; return 1; }
+    _normalize_sub_config "$work/decoded" || return 1
+    if _is_native_yaml_config "$work/decoded"; then
+        cp -- "$work/decoded" "$work/config.yaml" || return 1
+    else
+        [ "$strategy" != raw ] || { _errorcat 'raw 模式需要 Base64 编码的 Clash/Mihomo YAML'; return 1; }
+        # 不将任意文本当作 URL 交给转换器，防止手动导入重新下载订阅。
+        LC_ALL=C awk '
+            /^[[:space:]]*$/ { next }
+            !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\// || /^https?:\/\// || /^file:\/\// { exit 1 }
+            { found=1 }
+            END { if (!found) exit 1 }
+        ' "$work/decoded" || { _errorcat '解码内容不是 Clash/Mihomo YAML 或节点链接列表'; return 1; }
+        _convert_local_config "$work/config.yaml" "$work/decoded" || return 1
+    fi
+    _valid_config "$work/config.yaml" && _valid_sub_nodes "$work/config.yaml" || return 1
+    if [ -n "$name" ]; then _sub_validate_name "$name" || return 1; fi
+    _with_profiles_lock _sub_add_locked "$name" 'manual:base64' "$use_after_add" "$work/config.yaml" '' '' manual
+)
+
 # 临界区：确定唯一名称/路径、落盘、写入元数据（可选立即启用）
 _sub_add_locked() {
     local name=$1 url=$2 use_after_add=$3 dl_file=$4 userinfo=$5 filename=$6
+    local source=${7:-url}
 
     # 下载期间可能已有并发操作占用了同名/同链接，锁内再权威校验一次
     if [ -n "$name" ]; then
@@ -629,7 +706,7 @@ _sub_add_locked() {
         [ -z "$base" ] && base=$(_sub_default_name "$url")
         name=$(_sub_unique_name "$base")
     fi
-    _sub_url_exists "$url" && {
+    [ "$source" = url ] && _sub_url_exists "$url" && {
         /usr/bin/rm -f "$dl_file"
         _errorcat "该订阅链接已存在：$url"
         return 1
@@ -642,13 +719,14 @@ _sub_add_locked() {
 
     local now
     now=$(date +"%Y-%m-%d %H:%M:%S")
-    PROFILE_NAME=$name PROFILE_PATH=$profile_path PROFILE_URL=$url PROFILE_UPDATED=$now PROFILE_USERINFO=$userinfo \
+    PROFILE_NAME=$name PROFILE_PATH=$profile_path PROFILE_URL=$url PROFILE_UPDATED=$now PROFILE_USERINFO=$userinfo PROFILE_SOURCE=$source \
         "$BIN_YQ" -i '
             .profiles = (.profiles // []) +
             [{
               "name": strenv(PROFILE_NAME),
               "path": strenv(PROFILE_PATH),
               "url": strenv(PROFILE_URL),
+              "source": strenv(PROFILE_SOURCE),
               "updated": strenv(PROFILE_UPDATED),
               "userinfo": strenv(PROFILE_USERINFO)
             }]
@@ -921,6 +999,7 @@ Usage:
   clashctl sub update [名称] [选项]
 
 重新下载并校验订阅；更新当前订阅后会重新应用配置。
+手动导入的 Base64 订阅不更新（包括 --all），需要更换内容时请重新导入。
 省略名称时更新当前订阅；没有当前订阅时，仅交互终端可选择。
 默认直接校验下载内容，失败时尝试转换并重新校验。
 
@@ -1041,6 +1120,10 @@ _sub_update_one() {
         _errorcat "订阅不存在：$name"
         return 1
     }
+    if [ "$(_sub_get "$name" source)" = manual ]; then
+        _ui_emit_fd 1 info "跳过手动订阅：[$name]；如需更换内容，请重新导入"
+        return 0
+    fi
 
     local url path
     url=$(_sub_get "$name" url)

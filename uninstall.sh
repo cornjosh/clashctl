@@ -95,6 +95,11 @@ main() (
     }
     # shellcheck source=/dev/null
     . "$operation_lock_lib" || return 1
+    # notebook 卸载与安装/更新使用同一处临时锁；此时尚未 source .env。
+    CLASHCTL_INSTALL_MODE=''
+    if grep -qx 'CLASHCTL_INSTALL_MODE=notebook' "$install_home/.env" 2>/dev/null; then
+        CLASHCTL_INSTALL_MODE=notebook
+    fi
     trap 'rc=$?; trap - EXIT; trap "" INT TERM HUP; operation_lock_release || true; exit "$rc"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

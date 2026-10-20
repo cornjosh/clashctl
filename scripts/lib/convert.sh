@@ -78,8 +78,10 @@ _is_html_response() {
 
 _is_native_yaml_config() {
     "$BIN_YQ" -e '
-      ((.proxies // []) | type == "!!seq" and length > 0) or
-      ((.proxy-providers // {}) | type == "!!map" and length > 0)
+      (tag == "!!map") and (
+        ((.proxies // []) | ((tag == "!!seq") and (length > 0))) or
+        ((.proxy-providers // {}) | ((tag == "!!map") and (length > 0)))
+      )
     ' "$1" >/dev/null 2>&1
 }
 
@@ -199,6 +201,38 @@ _download_convert_config() {
     )
 }
 
+# data URI 仅发送给本地转换器；list 模式避免获取远程规则模板。
+# curl 从临时文件读取参数，避免把节点内容暴露在进程命令行中。
+_convert_local_config() (
+    set -o pipefail
+    local dest=$1 input=$2 uri group=PROXY
+    uri=$(mktemp "${CLASH_RESOURCES_DIR}/.convert.XXXXXX") || return 1
+    trap '_stop_convert; command rm -f -- "$uri"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    # subconverter 的订阅解析器还会解码一次 Base64，所以 data URI 的正文
+    # 必须是编码后的订阅；此处不加 ;base64，避免 data URI 层提前解码。
+    # 使用 URL-safe 字母表，防止 data URI 内的 + 被转换器当作空格。
+    { printf 'data:text/plain,'; base64 <"$input" | tr -d '\n' | tr '/+' '_-'; } >"$uri" || return 1
+    _start_convert || return 1
+    curl --noproxy '*' --get --silent --show-error --fail \
+        --max-time "${CLASHCTL_SUB_TIMEOUT:-20}" \
+        --data-urlencode 'target=clash' --data-urlencode "url@$uri" \
+        --data-urlencode 'list=true' --data-urlencode 'insert=false' \
+        --data-urlencode 'new_name=true' --output "$dest" \
+        "http://127.0.0.1:${BIN_SUBCONVERTER_PORT}/sub" || return 1
+    _normalize_sub_config "$dest" && _valid_sub_nodes "$dest" || return 1
+    # 节点列表没有路由规则，补一个可切换的代理组及兜底规则。
+    while GROUP_NAME=$group "$BIN_YQ" -e '.proxies[] | select(.name == strenv(GROUP_NAME))' "$dest" >/dev/null 2>&1; do
+        group="${group}_"
+    done
+    GROUP_NAME=$group "$BIN_YQ" -i '
+        .proxy-groups = [{"name": strenv(GROUP_NAME), "type": "select", "proxies": [.proxies[].name]}] |
+        .rules = ["MATCH," + strenv(GROUP_NAME)]
+    ' "$dest"
+)
+
 _detect_subconverter_port() {
     BIN_SUBCONVERTER_PORT=$("$BIN_YQ" '.server.port' "$BIN_SUBCONVERTER_CONFIG")
     _is_port_used "$BIN_SUBCONVERTER_PORT" && {
@@ -219,12 +253,12 @@ _start_convert() {
 
     # 先在配置端口上探活：已有可用实例则直接复用（不记录 PID，_stop_convert 不误杀他人实例）
     BIN_SUBCONVERTER_PORT=$("$BIN_YQ" '.server.port' "$BIN_SUBCONVERTER_CONFIG")
-    local check_url="http://localhost:${BIN_SUBCONVERTER_PORT}/version"
-    curl --silent --fail "$check_url" >/dev/null 2>&1 && return 0
+    local check_url="http://127.0.0.1:${BIN_SUBCONVERTER_PORT}/version"
+    curl --noproxy '*' --connect-timeout 1 --max-time 2 --silent --fail "$check_url" >/dev/null 2>&1 && return 0
 
     # 端口被其他进程占用时换端口，再拉起自己的实例并记录 PID
     _detect_subconverter_port
-    check_url="http://localhost:${BIN_SUBCONVERTER_PORT}/version"
+    check_url="http://127.0.0.1:${BIN_SUBCONVERTER_PORT}/version"
     BIN_SUBCONVERTER_PID=$(
         (
             trap - INT TERM HUP
@@ -238,7 +272,7 @@ _start_convert() {
 
     local start now
     start=$(date +%s)
-    while ! curl --silent --fail "$check_url" >/dev/null 2>&1; do
+    while ! curl --noproxy '*' --connect-timeout 1 --max-time 2 --silent --fail "$check_url" >/dev/null 2>&1; do
         sleep 0.2
         now=$(date +%s)
         [ $((now - start)) -gt 10 ] && { _errorcat "订阅转换服务未启动，请检查日志：$BIN_SUBCONVERTER_LOG"; return 1; }
@@ -249,9 +283,9 @@ _start_convert() {
 _stop_convert() {
     # 仅回收自己拉起的实例，避免误杀其他并发操作正在使用的 subconverter
     [ -n "${BIN_SUBCONVERTER_PID:-}" ] || return 0
-    kill -TERM "$BIN_SUBCONVERTER_PID" 2>/dev/null
+    kill -TERM "$BIN_SUBCONVERTER_PID" 2>/dev/null || true
     sleep 0.2
-    kill -KILL "$BIN_SUBCONVERTER_PID" 2>/dev/null
+    kill -KILL "$BIN_SUBCONVERTER_PID" 2>/dev/null || true
     BIN_SUBCONVERTER_PID=
     return 0
 }

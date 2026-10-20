@@ -924,6 +924,7 @@ unzip_zip() {
 }
 
 apply_rc() {
+    [ "${CLASHCTL_INSTALL_MODE:-}" != notebook ] || return 0
     detect_rc
 
     local rc rc_status shell_name detail configured=()
@@ -976,6 +977,7 @@ apply_rc() {
     return 2
 }
 revoke_rc() {
+    [ "${CLASHCTL_INSTALL_MODE:-}" != notebook ] || return 0
     detect_rc --installed
 
     local rc failures=0
