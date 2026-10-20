@@ -25,3 +25,6 @@ archives/*
 
 # 内核运行时产物（写入 -d 工作目录）
 resources/cache.db
+
+.clashctl-tmp/
+.clashctl-uninstalling

@@ -54,7 +54,7 @@ _update_scripts() (
         _ui_error '缺少匹配的安装标记，已停止更新'
         return 1
     }
-    work=$(mktemp -d "${CLASHCTL_HOME}.update.XXXXXX") || return 1
+    work=$(if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then mktemp -d "$TMPDIR/update.XXXXXX"; else mktemp -d "${CLASHCTL_HOME}.update.XXXXXX"; fi) || return 1
     stage="$work/source"
     mkdir "$stage" || return 1
     _ui_step "下载更新：$branch"
@@ -65,7 +65,7 @@ _update_scripts() (
         fi
         dirty=$(git -C "$CLASHCTL_HOME" status --porcelain --untracked-files=no) || return 1
         [ -z "$dirty" ] || { _ui_error '安装目录存在本地代码修改，请提交或暂存后重试'; return 1; }
-        url=$(gh_proxy_url 'https://github.com/nelvko/clashctl.git')
+        url=$(gh_proxy_url 'https://github.com/cornjosh/clashctl.git')
         git -C "$CLASHCTL_HOME" -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 \
             fetch --depth 1 -- "$url" "$branch" || return 1
         target=$(git -C "$CLASHCTL_HOME" rev-parse FETCH_HEAD) || return 1

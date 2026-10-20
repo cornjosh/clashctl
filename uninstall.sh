@@ -163,7 +163,11 @@ main() (
         }
     fi
     _uninstall_ui_log info '删除安装目录'
-    command rm -rf -- "$install_home" || {
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+        operation_lock_remove_notebook_home
+    else
+        command rm -rf -- "$install_home"
+    fi || {
         _uninstall_ui_log error '删除安装目录失败，请检查残留文件'
         return 1
     }

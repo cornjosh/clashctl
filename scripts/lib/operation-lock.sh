@@ -56,9 +56,25 @@ _operation_lock_validate_tmp() {
         [ $((8#$mode & 01000)) -ne 0 ]
 }
 
+_operation_lock_notebook_base() {
+    local home=${CLASHCTL_HOME:-} base
+    _operation_lock_validate_base "$home" "$EUID" || return 1
+    [ ! -e "$home/.clashctl-uninstalling" ] && [ ! -L "$home/.clashctl-uninstalling" ] || return 1
+    base="$home/.clashctl-tmp"
+    if [ ! -e "$base" ] && [ ! -L "$base" ]; then
+        (umask 077; mkdir -m 0700 -- "$base") 2>/dev/null || true
+    fi
+    _directory_lock_validate "$base" || return 1
+    printf '%s\n' "$base"
+}
+
 _operation_lock_base() {
     local uid=$1 base
-    if [ "${CLASHCTL_INSTALL_MODE:-}" != notebook ] && [ "$uid" -eq 0 ] && _operation_lock_validate_base /run 0; then
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+        _operation_lock_notebook_base
+        return $?
+    fi
+    if [ "$uid" -eq 0 ] && _operation_lock_validate_base /run 0; then
         printf '/run\n'
         return 0
     fi
@@ -163,10 +179,14 @@ operation_lock_acquire() {
     local uid=$EUID base parent directory rc=0
     base=$(_operation_lock_base "$uid") || {
         _operation_lock_emit_error '无法使用安全的运行时目录建立操作锁，未修改系统'
-        _operation_lock_emit_detail '要求' '运行时目录必须安全，且不能被其他用户任意替换'
+        if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+            _operation_lock_emit_detail '要求' 'Notebook 使用安装目录中的 .clashctl-tmp（当前用户所有、权限 700）；安装目录不可被其他用户写入'
+        else
+            _operation_lock_emit_detail '要求' '运行时目录必须安全，且不能被其他用户任意替换'
+        fi
         return 1
     }
-    # The parent stays outside CLASHCTL_HOME and is never removed by uninstall.
+    # Ordinary installations share a runtime lock; notebook locks belong to their installation.
     parent="${base}/clashctl-operation-${uid}"
     if ! (umask 077; mkdir -m 0700 -- "$parent") 2>/dev/null; then
         _directory_lock_validate "$parent" || {
@@ -202,6 +222,13 @@ operation_lock_acquire() {
     CLASHCTL_OPERATION_LOCK_DIR=$directory
     CLASHCTL_OPERATION_LOCK_PID=$_DIRECTORY_LOCK_PID
     CLASHCTL_OPERATION_LOCK_TOKEN=$_DIRECTORY_LOCK_TOKEN
+    # Uninstall may have published its tombstone while this caller acquired.
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ] &&
+        { [ -e "$CLASHCTL_HOME/.clashctl-uninstalling" ] || [ -L "$CLASHCTL_HOME/.clashctl-uninstalling" ]; }; then
+        operation_lock_release || true
+        _operation_lock_emit_error '该安装正在卸载，已停止操作'
+        return 1
+    fi
     export -n CLASHCTL_OPERATION_LOCK_DIR CLASHCTL_OPERATION_LOCK_PID CLASHCTL_OPERATION_LOCK_TOKEN
 }
 
@@ -215,4 +242,25 @@ operation_lock_release() {
     fi
     _directory_lock_release "$directory" "$pid" "$token" || return 1
     unset CLASHCTL_OPERATION_LOCK_DIR CLASHCTL_OPERATION_LOCK_PID CLASHCTL_OPERATION_LOCK_TOKEN
+}
+
+# Keep the lock while removing payloads. The tombstone prevents acquisition
+# during removal of the runtime itself; the final rmdir cannot delete new files.
+operation_lock_remove_notebook_home() {
+    local home=$CLASHCTL_HOME path marker="$CLASHCTL_HOME/.clashctl-uninstalling"
+    [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ] || return 1
+    [ "${CLASHCTL_OPERATION_LOCK_DIR:-}" = "$home/.clashctl-tmp/clashctl-operation-$EUID/operation.lock.d" ] || return 1
+    _directory_lock_read_owner "$CLASHCTL_OPERATION_LOCK_DIR" || return 1
+    [ "$_DIRECTORY_LOCK_RECORDED_PID" = "$BASHPID" ] &&
+        [ "$_DIRECTORY_LOCK_RECORDED_TOKEN" = "$CLASHCTL_OPERATION_LOCK_TOKEN" ] || return 1
+    (umask 077; set -o noclobber; printf '%s\n' "$home" >"$marker") || return 1
+    for path in "$home"/* "$home"/.[!.]* "$home"/..?*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        case ${path##*/} in .clashctl-tmp | .clashctl-uninstalling) continue ;; esac
+        command rm -rf -- "$path" || return 1
+    done
+    operation_lock_release || return 1
+    command rm -rf -- "$home/.clashctl-tmp" || return 1
+    command rm -- "$marker" || return 1
+    rmdir -- "$home"
 }

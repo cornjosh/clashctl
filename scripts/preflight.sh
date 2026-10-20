@@ -11,6 +11,11 @@ for lib_file in "$CLASHCTL_SRC"/scripts/lib/*.sh; do
     . "$lib_file"
 done
 
+if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+    TMPDIR=$(_operation_lock_notebook_base) || return 1
+    export TMPDIR
+fi
+
 # 查询最新版本失败时使用已知可用版本。
 DEFAULT_VERSION_MIHOMO=v1.19.27
 DEFAULT_VERSION_YQ=v4.53.3

@@ -32,6 +32,25 @@ prepare_zip() {
     cp "$TEST_MIHOMO" "$CLASHCTL_HOME/bin/mihomo"
 }
 EOF
+# Enforce every installer/update mktemp destination, including explicit templates.
+mkdir "$WORK_DIR/tools"
+export TEST_REAL_MKTEMP
+TEST_REAL_MKTEMP=$(command -v mktemp)
+export TEST_NOTEBOOK_DEFAULT="$WORK_DIR/source/.clashctl" TEST_NOTEBOOK_CUSTOM="$WORK_DIR/custom"
+cat >"$WORK_DIR/tools/mktemp" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+template=''
+for arg in "$@"; do case $arg in -*) ;; *) template=$arg ;; esac; done
+template=${template:-${TMPDIR:-/tmp}/tmp.XXXXXXXXXX}
+case $template in
+"$TEST_NOTEBOOK_DEFAULT/"* | "$TEST_NOTEBOOK_CUSTOM/"*) ;;
+*) printf 'temporary path escaped installation: %s\n' "$template" >&2; exit 1 ;;
+esac
+exec "$TEST_REAL_MKTEMP" "$@"
+EOF
+chmod +x "$WORK_DIR/tools/mktemp"
+export PATH="$WORK_DIR/tools:$PATH" TMPDIR="$WORK_DIR/unusable-tmp"
 cd "$WORK_DIR/source"
 bash install.sh --local --notebook >"$WORK_DIR/install.out" 2>&1 || { cat "$WORK_DIR/install.out"; fail 'notebook installation failed'; }
 [ -f .clashctl/init.sh ] || fail 'current directory was not used'
@@ -47,6 +66,10 @@ bash -c '
     unset http_proxy https_proxy all_proxy
     source "$installed/init.sh" --commands-only
     type clashctl >/dev/null
+    test "$TMPDIR" = "$installed/.clashctl-tmp"
+    temporary=$(mktemp)
+    test -f "$temporary"
+    rm "$temporary"
     test -z "${http_proxy:-}"
     clashctl stop
     source "$installed/init.sh" --commands-only
@@ -89,6 +112,13 @@ bash "$installed/uninstall.sh" --yes >"$WORK_DIR/uninstall.out" 2>&1 || { cat "$
 printf 'proxies:\n  - {name: test, type: ss, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: test}\ntun: {enable: true}\n' |
     base64 >"$WORK_DIR/subscription.b64"
 custom="$WORK_DIR/custom"
+# Failed source preparation leaves only the private runtime; retry must work.
+mv init.sh init.sh.disabled
+if bash install.sh --local --notebook --home "$custom" >"$WORK_DIR/failed-source.out" 2>&1; then
+    fail 'invalid notebook source accepted'
+fi
+mv init.sh.disabled init.sh
+[ -d "$custom/.clashctl-tmp" ] || fail 'bootstrap runtime missing'
 bash install.sh --local --notebook --home "$custom" --sub-base64-file "$WORK_DIR/subscription.b64" >"$WORK_DIR/custom.out" 2>&1 || { cat "$WORK_DIR/custom.out"; fail 'custom installation failed'; }
 [ "$("$TEST_YQ" '.profiles[0].source' "$custom/data/profiles.yaml")" = manual ] || fail 'installer did not import manual subscription'
 [ "$("$TEST_YQ" '.tun.enable' "$custom/data/runtime.yaml")" = false ] || fail 'subscription enabled TUN'

@@ -8,6 +8,11 @@ for lib_file in "$CLASHCTL_HOME"/scripts/lib/*.sh; do
     . "$lib_file"
 done
 
+if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+    TMPDIR=$(_operation_lock_notebook_base) || return 1
+    export TMPDIR
+fi
+
 for cmd_file in "$CLASHCTL_HOME"/scripts/cmd/*.sh; do
     case "$cmd_file" in *clashctl.*) continue ;; esac
     # shellcheck disable=SC1090  # 运行时按安装目录加载子命令

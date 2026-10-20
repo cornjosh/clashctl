@@ -36,7 +36,27 @@ _install_restore_operation_lock() {
     . "$CLASHCTL_INSTALL_LOCK_LIB"
 }
 
-# 尚未安装时，仅允许预先准备 archives，不放宽已安装目录的身份识别。
+# 管道入口尚未取得公共库，先在指定安装目录内建立私有暂存区。
+_install_notebook_runtime() {
+    local home=$1 path metadata
+    if [ ! -e "$home" ] && [ ! -L "$home" ]; then
+        (umask 077; mkdir -p -- "$home") || return 1
+    fi
+    for path in "$home" "$home/.clashctl-tmp"; do
+        if [ "$path" != "$home" ] && [ ! -e "$path" ] && [ ! -L "$path" ]; then
+            (umask 077; mkdir -m 0700 -- "$path") 2>/dev/null || true
+        fi
+        [ -d "$path" ] && [ ! -L "$path" ] || return 1
+        metadata=$(stat -c '%u:%a' -- "$path") || return 1
+        [ "${metadata%%:*}" = "$EUID" ] && [ $((8#${metadata#*:} & 0022)) -eq 0 ] || {
+            printf 'Notebook 目录归属或权限不安全：%s\n' "$path" >&2; return 1;
+        }
+        [ "$path" = "$home" ] || [ "${metadata#*:}" = 700 ] || return 1
+    done
+    export TMPDIR="$home/.clashctl-tmp" CLASHCTL_HOME="$home"
+}
+
+# 尚未安装时只允许预置 archives；notebook 另允许自举创建的私有暂存区。
 _install_prepared_archives_safe() {
     local home=$1 path owner mode unexpected
     for path in "$home" "$home/archives"; do
@@ -47,7 +67,15 @@ _install_prepared_archives_safe() {
         [ "$owner" = "$(id -u)" ] && [ $((8#$mode & 0700)) -eq $((8#700)) ] &&
             [ $((8#$mode & 0022)) -eq 0 ] || return 1
     done
-    unexpected=$(find "$home" -mindepth 1 -maxdepth 1 ! -name archives -print -quit) || return 1
+    if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+        if [ -e "$home/.clashctl-tmp" ] || [ -L "$home/.clashctl-tmp" ]; then
+            [ -d "$home/.clashctl-tmp" ] && [ ! -L "$home/.clashctl-tmp" ] &&
+                [ "$(stat -c '%u:%a' -- "$home/.clashctl-tmp")" = "$EUID:700" ] || return 1
+        fi
+        unexpected=$(find "$home" -mindepth 1 -maxdepth 1 ! -name archives ! -name .clashctl-tmp -print -quit) || return 1
+    else
+        unexpected=$(find "$home" -mindepth 1 -maxdepth 1 ! -name archives -print -quit) || return 1
+    fi
     [ -z "$unexpected" ] || return 1
     if [ -d "$home/archives" ]; then
         unexpected=$(find "$home/archives" -mindepth 1 \
@@ -239,7 +267,7 @@ _install_refresh_current() (
             printf 'Git 安装不能直接覆盖为未提交的本地源码；请使用远端更新或另选安装目录\n' >&2
             return 1
         }
-        work=$(mktemp -d "${home}.update.XXXXXX") || return 1
+        work=$(if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then mktemp -d "$TMPDIR/update.XXXXXX"; else mktemp -d "${home}.update.XXXXXX"; fi) || return 1
         # 回滚失败时，更新器会标记 keep 并留下 previous.tar 供手动恢复。
         stage="$work/source"
         mkdir "$stage" || return 1
@@ -285,7 +313,7 @@ _install_prepare_source() {
         _install_copy_local_source "$script_dir" "$destination" || return 1
     elif command -v git >/dev/null 2>&1; then
         method=git
-        url=https://github.com/nelvko/clashctl.git
+        url=https://github.com/cornjosh/clashctl.git
         local -a clone_options=(--depth 1 --branch "$branch")
         [ "${_INSTALL_VERBOSE:-}" = 1 ] || clone_options+=(--quiet)
         [ -z "$proxy" ] || url="${proxy%/}/$url"
@@ -588,7 +616,7 @@ _source_archive() (
     archive=$(mktemp) || return 1
     entries="${archive}.list"
     trap 'rm -f -- "$archive" "$entries"' EXIT
-    url="https://github.com/nelvko/clashctl/archive/refs/heads/${branch}.tar.gz"
+    url="https://github.com/cornjosh/clashctl/archive/refs/heads/${branch}.tar.gz"
     [ -z "$proxy" ] || url="${proxy%/}/$url"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o "$archive" "$url" || return 1
@@ -1201,7 +1229,7 @@ HELP
         script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
     fi
     if [ "$local_source" = true ] && [ -z "$script_dir" ]; then
-        printf '%s\n' '--local 需要从本地源码目录中的 install.sh 执行，不支持管道输入' >&2
+        printf '%s\n' '--local 需要从本地源码目录中的 install.sh 执行，不支持管道输入；管道安装请去掉 --local' >&2
         return 1
     fi
     # 服务单元名与内核二进制路径都派生自它，必须在 sourcing 前导出。
@@ -1239,7 +1267,7 @@ HELP
             fi
         fi
         if [ "$existing_kind" = current ]; then
-            # 在第一次取锁前确定模式；root notebook 的续装也必须一直使用 /tmp 锁。
+            # 在第一次取锁前确定模式；notebook 的续装也必须使用安装目录中的锁。
             # 模式字段由安装器以此字面值写入，无需在取锁前执行用户 .env。
             if grep -qx 'CLASHCTL_INSTALL_MODE=notebook' "$install_home/.env" 2>/dev/null; then
                 CLASHCTL_INSTALL_MODE=notebook
@@ -1247,12 +1275,15 @@ HELP
                 printf '已有普通安装不自动转换为 notebook 模式，请用 --home 指定独立目录\n' >&2
                 return 1
             fi
+            if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+                _install_notebook_runtime "$install_home" || return 1
+            fi
             if [ -n "$script_dir" ] && [ -f "$script_dir/scripts/lib/operation-lock.sh" ] &&
                 grep -q '^_directory_lock_acquire()' "$script_dir/scripts/lib/operation-lock.sh"; then
                 _install_lock "$script_dir" || return 1
             else
                 # 管道入口没有伴随库；先取得本次源码，不能借用旧安装中的锁实现。
-                stage=$(mktemp -d "${install_home}.download.XXXXXX") || return 1
+                stage=$(if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then mktemp -d "$TMPDIR/download.XXXXXX"; else mktemp -d "${install_home}.download.XXXXXX"; fi) || return 1
                 _install_prepare_source "$stage" "${branch:-master}" "$proxy" false '' || return 1
                 _install_lock "$stage" || return 1
             fi
@@ -1379,8 +1410,12 @@ HELP
         else
             _install_intro '新安装 clashctl' "$install_home" "$home_source" "$local_source" "$branch"
         fi
+        if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then
+            _install_notebook_runtime "$install_home" || return 1
+            prepared_archives=true
+        fi
         mkdir -p -- "$(dirname -- "$install_home")"
-        stage=$(mktemp -d "${install_home}.download.XXXXXX")
+        stage=$(if [ "${CLASHCTL_INSTALL_MODE:-}" = notebook ]; then mktemp -d "$TMPDIR/download.XXXXXX"; else mktemp -d "${install_home}.download.XXXXXX"; fi)
         [ "$local_source" = true ] || _install_bootstrap_log info "下载源码（分支 $branch）"
         _install_prepare_source "$stage" "$branch" "$proxy" "$local_source" "$script_dir"
         [ "$local_source" = true ] || _install_bootstrap_log ok '源码已准备'
